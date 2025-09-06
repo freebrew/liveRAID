@@ -1,0 +1,14 @@
+[package]
+name = "raidctl"
+version = { workspace = true }
+edition = { workspace = true }
+authors = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+
+[dependencies]
+raidctl-core = { path = "../raidctl-core" }
+clap = { workspace = true }
+anyhow = { workspace = true }
+env_logger = { workspace = true }
+log = { workspace = true }
