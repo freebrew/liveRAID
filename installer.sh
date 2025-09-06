@@ -78,7 +78,7 @@ set -e
 LIVE_USER="$SUDO_USER"
 LIVE_PASSWORD="live"
 LOG_FILE="/var/log/raidctl-installer.log"
-PROJECT_DIR="/home/$SUDO_USER/Desktop/mdadm_RAIDlive/raidctl"
+PROJECT_DIR="$(dirname "$0")/raidctl"
 INSTALL_DIR="/usr/local/bin"
 CONFIG_DIR="/etc/raidctl"
 APP_DIR="/usr/local/share/raidctl"
