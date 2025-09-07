@@ -336,31 +336,230 @@ impl eframe::App for RaidCtlApp {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("RAID Provisioning Tool");
-            ui.add_space(10.0);
+    ui.heading("RAID Provisioning Tool");
+    ui.add_space(10.0);
 
-            // Status bar with refresh button
+    // Status bar with refresh button
+    ui.horizontal(|ui| {
+        if ui.button("🔄 Refresh").clicked() {
+            self.refresh_requested = true;
+            self.load_existing_grub_config();
+            self.parse_raid_entries();
+            self.available_tools = Self::detect_available_tools();
+            self.status = "Device list and tools refreshed".to_string();
+        }
+    });
+
+    ui.separator();
+    ui.add_space(10.0);
+
+    let selected_devices = self.selected_devices.clone();
+    let devices_clone = {
+        let devices = self.devices.lock().unwrap();
+        devices.clone()
+    };
+
+    // --- Top Row: Available Storage Devices ---
+    ui.heading("Available Storage Devices");
+    if devices_clone.is_empty() {
+        ui.label("No storage devices found. Click 'Refresh Devices' to scan.");
+    } else {
+        egui::ScrollArea::horizontal().show(ui, |ui| {
             ui.horizontal(|ui| {
-                if ui.button("🔄 Refresh").clicked() {
-                    self.refresh_requested = true;
-                    self.load_existing_grub_config();
-                    self.parse_raid_entries();
-                    self.available_tools = Self::detect_available_tools();
-                    self.status = "Device list and tools refreshed".to_string();
+                for device in devices_clone.iter() {
+                    let is_selected = self.selected_devices.contains(&device.path);
+                    ui.group(|ui| {
+                        ui.vertical(|ui| {
+                            // Large device icon
+                            let icon_color = if is_selected {
+                                egui::Color32::from_rgb(0, 200, 100)
+                            } else {
+                                egui::Color32::from_rgb(100, 150, 200)
+                            };
+                            ui.label(
+                                egui::RichText::new("💾")
+                                    .size(40.0)
+                                    .color(icon_color)
+                            );
+                            // Device path button
+                            let path_color = if is_selected {
+                                egui::Color32::from_rgb(0, 200, 100)
+                            } else {
+                                egui::Color32::WHITE
+                            };
+                            let button = egui::Button::new(
+                                egui::RichText::new(&device.path)
+                                    .color(path_color)
+                                    .size(18.0)
+                            )
+                            .fill(if is_selected {
+                                egui::Color32::from_rgba_premultiplied(0, 100, 50, 100)
+                            } else {
+                                egui::Color32::from_rgba_premultiplied(50, 50, 50, 50)
+                            })
+                            .min_size(egui::vec2(120.0, 28.0));
+                            if ui.add(button).clicked() {
+                                if is_selected {
+                                    self.selected_devices.retain(|d| d != &device.path);
+                                } else {
+                                    self.selected_devices.push(device.path.clone());
+                                }
+                                self.current_plan = None;
+                            }
+                            // Device details stacked vertically
+                            if let Some(model) = &device.model {
+                                ui.label(format!("Model: {}", model));
+                            }
+                            if let Some(serial) = &device.serial {
+                                ui.label(format!("Serial: {}", serial));
+                            }
+                            ui.label(format!("Size: {}", format_size(device.size)));
+                        });
+                    });
+                    ui.add_space(16.0);
                 }
             });
+        });
+    }
+    ui.add_space(8.0);
 
-            ui.separator();
-            ui.add_space(10.0);
-
-            let selected_devices = self.selected_devices.clone();
-            let devices_clone = {
-                let devices = self.devices.lock().unwrap();
-                devices.clone()
+    // --- Second Row: RAID Level, Filesystem, Bootable Checkbox ---
+    ui.horizontal(|ui| {
+        // RAID Level dropdown
+        ui.vertical(|ui| {
+            ui.heading("RAID Level");
+            let selected_text = if let Some(level) = &self.selected_raid_level {
+                format!("{} - {}", level.display_name(), level.description())
+            } else {
+                "Select RAID Level".to_string()
             };
+            egui::ComboBox::from_id_source("raid_level_combo")
+                .selected_text(selected_text)
+                .width(330.0)
+                .show_ui(ui, |ui| {
+                    for level in RaidLevel::all().iter() {
+                        let text = format!("{} - {}", level.display_name(), level.description());
+                        let is_selected = self.selected_raid_level.as_ref() == Some(level);
+                        if ui.selectable_label(is_selected, text).clicked() {
+                            self.selected_raid_level = Some(level.clone());
+                            self.current_plan = None;
+                        }
+                    }
+                });
+        });
+        ui.add_space(20.0);
+        // Filesystem Type dropdown
+        ui.vertical(|ui| {
+            ui.heading("Filesystem Type");
+            let selected_text = if let Some(fs_name) = &self.selected_filesystem {
+                if let Some(filesystem) = Filesystem::from_str(fs_name) {
+                    format!("{} - {}", filesystem.display_name(), filesystem.description())
+                } else {
+                    fs_name.clone()
+                }
+            } else {
+                "Select Filesystem Type".to_string()
+            };
+            egui::ComboBox::from_id_source("filesystem_combo")
+                .selected_text(selected_text)
+                .width(330.0)
+                .show_ui(ui, |ui| {
+                    for fs_type in FILESYSTEM_TYPES.iter() {
+                        if let Some(filesystem) = Filesystem::from_str(fs_type) {
+                            let text = format!("{} - {}", filesystem.display_name(), filesystem.description());
+                            let is_selected = self.selected_filesystem.as_ref() == Some(&fs_type.to_string());
+                            if ui.selectable_label(is_selected, text).clicked() {
+                                self.selected_filesystem = Some(fs_type.to_string());
+                                self.current_plan = None;
+                            }
+                        }
+                    }
+                });
+        });
+        ui.add_space(20.0);
+        // Bootable Checkbox
+        if ui.checkbox(&mut self.bootable_flag, "Mark RAID as bootable").clicked() {
+            self.current_plan = None;
+        }
+    });
+    ui.add_space(8.0);
 
-            // Main device grid with RAID level and filesystem selection at the top
-            ui.vertical(|ui| {
+    // --- Third Row: System Tools ---
+    ui.horizontal(|ui| {
+        if ui.button("Launch fdisk").clicked() {
+            self.run_terminal_command("fdisk -l");
+        }
+        if ui.button("Launch parted").clicked() {
+            self.run_terminal_command("parted -l");
+        }
+        if ui.button("Launch GParted").clicked() {
+            self.launch_partition_tool("gparted");
+        }
+        if ui.button("Write To fstab").clicked() {
+            match self.write_to_fstab() {
+                Ok(_) => {
+                    self.status = "✅ RAID configuration written to fstab successfully".to_string();
+                    self.load_file_to_canvas("/etc/fstab");
+                }
+                Err(e) => {
+                    self.status = format!("❌ Error writing to fstab: {}", e);
+                }
+            }
+        }
+    });
+    ui.add_space(8.0);
+
+    // --- Dynamic Canvas: Terminal or Config File ---
+    ui.horizontal(|ui| {
+        if ui.button("Show Terminal").clicked() {
+            self.canvas_mode = CanvasMode::Terminal;
+        }
+        if ui.button("Show Config File").clicked() {
+            self.canvas_mode = CanvasMode::Config;
+        }
+    });
+    ui.separator();
+    match self.canvas_mode {
+        CanvasMode::Terminal => {
+            ui.heading("Embedded Terminal Output");
+            ui.add_sized([
+                ui.available_width(),
+                300.0
+            ], egui::TextEdit::multiline(&mut self.terminal_output)
+                .font(egui::TextStyle::Monospace)
+                .code_editor()
+                .interactive(false)
+            );
+            ui.horizontal(|ui| {
+                ui.label("Run command:");
+                ui.text_edit_singleline(&mut self.terminal_command_input);
+                if ui.button("Run").clicked() {
+                    self.run_terminal_command(&self.terminal_command_input);
+                }
+            });
+        }
+        CanvasMode::Config => {
+            ui.heading("Editable Config File");
+            if ui.button("Save Config").clicked() {
+                self.save_canvas_config();
+            }
+            ui.add_sized([
+                ui.available_width(),
+                300.0
+            ], egui::TextEdit::multiline(&mut self.config_file_text)
+                .font(egui::TextStyle::Monospace)
+                .code_editor()
+                .interactive(true)
+            );
+        }
+    }
+    ui.separator();
+    // Status message at the bottom
+    ui.label(&self.status);
+});
+
+// --- End of new layout ---
+
                 // RAID Level and Filesystem Type in one row
                 ui.horizontal(|ui| {
                     // RAID Level dropdown
@@ -375,7 +574,7 @@ impl eframe::App for RaidCtlApp {
                         
                         egui::ComboBox::from_id_source("raid_level_combo")
                             .selected_text(selected_text)
-                            .width(300.0)
+                            .width(330.0)
                             .show_ui(ui, |ui| {
                                 for level in RaidLevel::all().iter() {
                                     let text = format!("{} - {}", level.display_name(), level.description());
@@ -406,7 +605,7 @@ impl eframe::App for RaidCtlApp {
                         
                         egui::ComboBox::from_id_source("filesystem_combo")
                             .selected_text(selected_text)
-                            .width(300.0)
+                            .width(330.0)
                             .show_ui(ui, |ui| {
                                 for fs_type in FILESYSTEM_TYPES.iter() {
                                     if let Some(filesystem) = Filesystem::from_str(fs_type) {
@@ -425,11 +624,47 @@ impl eframe::App for RaidCtlApp {
                 ui.separator();
                 ui.add_space(10.0);
 
-                // Boot flag checkbox
+                // Boot flag checkbox and System Tools horizontally
                 ui.horizontal(|ui| {
                     if ui.checkbox(&mut self.bootable_flag, "Mark RAID as bootable").clicked() {
                         self.current_plan = None; // Clear plan when bootable flag changes
                     }
+
+                    // System Tools panel inline
+                    ui.separator();
+                    ui.vertical(|ui| {
+                        ui.heading("System Tools");
+                        let env_text = if self.is_live_environment {
+                            "🔴 Live Environment Detected"
+                        } else {
+                            "🟢 Installed System"
+                        };
+                        ui.label(env_text);
+                        ui.add_space(5.0);
+                        ui.horizontal(|ui| {
+                            if self.available_tools.fdisk {
+                                if ui.button("Launch fdisk").clicked() {
+                                    self.launch_partition_tool("fdisk");
+                                }
+                            } else {
+                                ui.add_enabled(false, egui::Button::new("Launch fdisk (not available)"));
+                            }
+                            if self.available_tools.parted {
+                                if ui.button("Launch parted").clicked() {
+                                    self.launch_partition_tool("parted");
+                                }
+                            } else {
+                                ui.add_enabled(false, egui::Button::new("Launch parted (not available)"));
+                            }
+                            if self.available_tools.gparted {
+                                if ui.button("Launch GParted").clicked() {
+                                    self.launch_partition_tool("gparted");
+                                }
+                            } else {
+                                ui.add_enabled(false, egui::Button::new("Launch GParted (not available)"));
+                            }
+                        });
+                    });
                 });
                 
                 ui.separator();
@@ -444,66 +679,62 @@ impl eframe::App for RaidCtlApp {
                     // Get the selection color before creating the grid
                     let _selection_color = ui.style().visuals.selection.bg_fill;
                     
-                    egui::Grid::new("devices_grid")
-                        .num_columns(2)
-                        .spacing([20.0, 10.0])
-                        .show(ui, |ui| {
-                            for device in devices_clone.iter() {
-                                let is_selected = self.selected_devices.contains(&device.path);
-                                
-                                // Device icon and selection button
-                                ui.horizontal(|ui| {
-                                    // Device icon that changes color when selected
-                                    let icon_color = if is_selected {
-                                        egui::Color32::from_rgb(0, 200, 100) // Green when selected
-                                    } else {
-                                        egui::Color32::from_rgb(100, 150, 200) // Blue when not selected
-                                    };
-                                    
-                                    ui.colored_label(icon_color, "💾");
-                                    
-                                    // Device path button
-                                    let path_color = if is_selected {
-                                        egui::Color32::from_rgb(0, 200, 100) // Green when selected
-                                    } else {
-                                        egui::Color32::WHITE
-                                    };
-                                    
-                                    let button = egui::Button::new(
-                                        egui::RichText::new(&device.path)
-                                            .color(path_color)
-                                    )
-                                    .fill(if is_selected { 
-                                        egui::Color32::from_rgba_premultiplied(0, 100, 50, 100) 
-                                    } else { 
-                                        egui::Color32::from_rgba_premultiplied(50, 50, 50, 50) 
-                                    })
-                                    .min_size(egui::vec2(150.0, 0.0));
-                                    
-                                    if ui.add(button).clicked() {
-                                        if is_selected {
-                                            self.selected_devices.retain(|d| d != &device.path);
-                                        } else {
-                                            self.selected_devices.push(device.path.clone());
-                                        }
-                                        self.current_plan = None; // Clear plan when device selection changes
-                                    }
-                                });
-                                
-                                // Show device details
-                                ui.vertical(|ui| {
-                                    if let Some(model) = &device.model {
-                                        ui.label(format!("Model: {}", model));
-                                    }
-                                    if let Some(serial) = &device.serial {
-                                        ui.label(format!("Serial: {}", serial));
-                                    }
-                                    ui.label(format!("Size: {}", format_size(device.size)));
-                                });
-                                
-                                ui.end_row();
-                            }
-                        });
+                    egui::ScrollArea::horizontal().show(ui, |ui| {
+    ui.horizontal(|ui| {
+        for device in devices_clone.iter() {
+            let is_selected = self.selected_devices.contains(&device.path);
+            ui.group(|ui| {
+                ui.vertical(|ui| {
+                    // Large device icon
+                    let icon_color = if is_selected {
+                        egui::Color32::from_rgb(0, 200, 100)
+                    } else {
+                        egui::Color32::from_rgb(100, 150, 200)
+                    };
+                    ui.label(
+                        egui::RichText::new("💾")
+                            .size(40.0)
+                            .color(icon_color)
+                    );
+                    // Device path button
+                    let path_color = if is_selected {
+                        egui::Color32::from_rgb(0, 200, 100)
+                    } else {
+                        egui::Color32::WHITE
+                    };
+                    let button = egui::Button::new(
+                        egui::RichText::new(&device.path)
+                            .color(path_color)
+                            .size(18.0)
+                    )
+                    .fill(if is_selected {
+                        egui::Color32::from_rgba_premultiplied(0, 100, 50, 100)
+                    } else {
+                        egui::Color32::from_rgba_premultiplied(50, 50, 50, 50)
+                    })
+                    .min_size(egui::vec2(120.0, 28.0));
+                    if ui.add(button).clicked() {
+                        if is_selected {
+                            self.selected_devices.retain(|d| d != &device.path);
+                        } else {
+                            self.selected_devices.push(device.path.clone());
+                        }
+                        self.current_plan = None;
+                    }
+                    // Device details stacked vertically
+                    if let Some(model) = &device.model {
+                        ui.label(format!("Model: {}", model));
+                    }
+                    if let Some(serial) = &device.serial {
+                        ui.label(format!("Serial: {}", serial));
+                    }
+                    ui.label(format!("Size: {}", format_size(device.size)));
+                });
+            });
+            ui.add_space(16.0);
+        }
+    });
+});
                 }
                 
                 // Action buttons at the bottom
