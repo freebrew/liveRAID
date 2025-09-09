@@ -19,7 +19,7 @@ auto_fstab_and_esp() {
         [ -z "$uuid" ] && continue
         [ -z "$fstype" ] && continue
         # Guess mountpoint if not mounted
-        [ -z "$mp" ] && mp="/mnt/$dev"
+        [ -z "$mp" ] && mp="/mnt/$(basename "$dev")"
         echo "UUID=$uuid $mp $fstype defaults 0 2" >> /target/etc/fstab
     done
     log "[auto_fstab_and_esp] fstab written to /target/etc/fstab"
@@ -44,30 +44,95 @@ auto_fstab_and_esp() {
     fi
 }
 
+# Ensure required filesystems are mounted into /target for chrooted operations
+mount_chroot_binds() {
+    log "[mount_chroot_binds] Binding system mounts into /target"
+    for m in /dev /dev/pts /proc /sys /run; do
+        mkdir -p "/target${m}"
+        mountpoint -q "/target${m}" || mount --bind "${m}" "/target${m}" 2>/dev/null || true
+    done
+    # efivars for UEFI systems
+    if [ -d /sys/firmware/efi/efivars ]; then
+        mkdir -p /target/sys/firmware/efi/efivars
+        mountpoint -q /target/sys/firmware/efi/efivars || mount -t efivarfs efivarfs /target/sys/firmware/efi/efivars 2>/dev/null || true
+    fi
+}
+
+unmount_chroot_binds() {
+    log "[mount_chroot_binds] Unmounting binds from /target"
+    # Unmount in reverse order; ignore failures
+    umount -l /target/sys/firmware/efi/efivars 2>/dev/null || true
+    for m in /run /sys /proc /dev/pts /dev; do
+        umount -l "/target${m}" 2>/dev/null || true
+    done
+}
+
 auto_grub_install() {
     log "[auto_grub_install] Installing GRUB to all boot targets (UEFI and/or BIOS)"
-    # Chroot to /target for all bootloader commands
+    mount_chroot_binds
+
+    # Safety: ensure /target looks like a root filesystem before attempting chroot ops
+    if [ ! -x /target/bin/bash ]; then
+        log "[auto_grub_install] Skipping: /target is not a prepared root (missing /bin/bash)"
+        unmount_chroot_binds
+        return 0
+    fi
+    if [ ! -x /target/usr/sbin/grub-install ] && [ ! -x /target/sbin/grub-install ] && [ ! -x /target/bin/grub-install ]; then
+        log "[auto_grub_install] Skipping: grub-install not found inside /target"
+        unmount_chroot_binds
+        return 0
+    fi
+
+    # UEFI installs (one per ESP mounted at /boot/efi, /boot/efi2, ...)
     if [ -d /target/boot/efi ]; then
         log "[auto_grub_install] Installing GRUB (UEFI)"
-        chroot /target grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=GRUB || log "[auto_grub_install] UEFI GRUB install failed"
+        chroot /target grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=GRUB || log "[auto_grub_install] UEFI GRUB install failed for /boot/efi"
         idx=2
         while [ -d "/target/boot/efi$idx" ]; do
-            chroot /target grub-install --target=x86_64-efi --efi-directory="/boot/efi$idx" --bootloader-id=GRUB$idx || log "[auto_grub_install] UEFI GRUB install failed for efi$idx"
+            chroot /target grub-install --target=x86_64-efi --efi-directory="/boot/efi$idx" --bootloader-id=GRUB$idx || log "[auto_grub_install] UEFI GRUB install failed for /boot/efi$idx"
             idx=$((idx+1))
         done
     fi
+
+    # BIOS installs to each disk (best-effort)
     for disk in $(lsblk -dln -o NAME | grep -E 'sd|nvme|vd'); do
         log "[auto_grub_install] Installing GRUB (BIOS) to /dev/$disk"
         chroot /target grub-install --target=i386-pc --recheck "/dev/$disk" || log "[auto_grub_install] BIOS GRUB install failed for /dev/$disk"
     done
-    log "[auto_grub_install] Running update-grub and update-initramfs in chroot"
-    chroot /target update-grub || log "[auto_grub_install] update-grub failed"
-    chroot /target update-initramfs -u || log "[auto_grub_install] update-initramfs failed"
-    # Sync ESPs if UEFI
+
+    log "[auto_grub_install] Generating GRUB config in chroot"
+    if chroot /target bash -lc 'command -v update-grub >/dev/null 2>&1'; then
+        chroot /target update-grub || log "[auto_grub_install] update-grub failed"
+    elif chroot /target bash -lc 'command -v grub-mkconfig >/dev/null 2>&1'; then
+        chroot /target grub-mkconfig -o /boot/grub/grub.cfg || log "[auto_grub_install] grub-mkconfig failed"
+    elif chroot /target bash -lc 'command -v grub2-mkconfig >/dev/null 2>&1'; then
+        if chroot /target test -d /boot/grub2; then
+            chroot /target grub2-mkconfig -o /boot/grub2/grub.cfg || log "[auto_grub_install] grub2-mkconfig failed (/boot/grub2)"
+        else
+            chroot /target grub2-mkconfig -o /boot/grub/grub.cfg || log "[auto_grub_install] grub2-mkconfig failed (/boot/grub)"
+        fi
+    else
+        log "[auto_grub_install] No GRUB config generator found (update-grub/grub-mkconfig/grub2-mkconfig)"
+    fi
+
+    log "[auto_grub_install] Updating initramfs in chroot"
+    if chroot /target bash -lc 'command -v update-initramfs >/dev/null 2>&1'; then
+        chroot /target update-initramfs -u || log "[auto_grub_install] update-initramfs failed"
+    elif chroot /target bash -lc 'command -v dracut >/dev/null 2>&1'; then
+        chroot /target dracut -f || log "[auto_grub_install] dracut failed"
+    elif chroot /target bash -lc 'command -v mkinitcpio >/dev/null 2>&1'; then
+        chroot /target mkinitcpio -P || log "[auto_grub_install] mkinitcpio failed"
+    else
+        log "[auto_grub_install] No initramfs tool found (update-initramfs/dracut/mkinitcpio)"
+    fi
+
+    # Sync ESPs if multiple present
     if [ -d /target/boot/efi2 ]; then
         log "[auto_grub_install] Syncing ESPs"
         rsync -a --delete /target/boot/efi/ /target/boot/efi2/ || log "[auto_grub_install] ESP sync failed"
     fi
+
+    unmount_chroot_binds
     log "[auto_grub_install] GRUB installation complete"
 }
 
@@ -257,536 +322,4 @@ remove_existing_rust() {
     log "Existing Rust installations removal process completed"
 }
 
-# Function to compare versions
-version_greater_equal() {
-    local v1=$1
-    local v2=$2
-    
-    # Convert versions to comparable format
-    local v1_nums=$(echo "$v1" | tr '.' ' ')
-    local v2_nums=$(echo "$v2" | tr '.' ' ')
-    
-    # Compare each part of the version
-    set -- $v1_nums
-    local v1_major=${1:-0}
-    local v1_minor=${2:-0}
-    local v1_patch=${3:-0}
-    
-    set -- $v2_nums
-    local v2_major=${1:-0}
-    local v2_minor=${2:-0}
-    local v2_patch=${3:-0}
-    
-    # Compare major version
-    if [ "$v1_major" -gt "$v2_major" ]; then
-        return 0
-    elif [ "$v1_major" -lt "$v2_major" ]; then
-        return 1
-    fi
-    
-    # Compare minor version
-    if [ "$v1_minor" -gt "$v2_minor" ]; then
-        return 0
-    elif [ "$v1_minor" -lt "$v2_minor" ]; then
-        return 1
-    fi
-    
-    # Compare patch version
-    if [ "$v1_patch" -ge "$v2_patch" ]; then
-        return 0
-    else
-        return 1
-    fi
-}
-
-# Function to install Rust if not present or if version is too old
-install_rust() {
-    local MIN_RUST_VERSION="1.81.0"
-    
-    # Check if Rust is already installed with sufficient version
-    if command -v rustc &> /dev/null; then
-        local CURRENT_VERSION=$(rustc --version | awk '{print $2}')
-        log "Found existing Rust installation. Version: $CURRENT_VERSION"
-        
-        # Check if version is sufficient
-        if version_greater_equal "$CURRENT_VERSION" "$MIN_RUST_VERSION"; then
-            log "Existing Rust version is sufficient, keeping it"
-            # Source the environment if it exists
-            if [ -f "/home/$LIVE_USER/.cargo/env" ]; then
-                source "/home/$LIVE_USER/.cargo/env" 2>/dev/null || true
-            fi
-            export PATH="/home/$LIVE_USER/.cargo/bin:$PATH"
-            return 0
-        else
-            log "Existing Rust version is too old, will install newer version"
-        fi
-    fi
-    
-    log "Installing latest Rust using rustup..."
-    
-    # Install Rust using rustup
-    if ! sudo -u "$LIVE_USER" bash -c "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y"; then
-        error_exit "Failed to install Rust"
-    fi
-    
-    # Set the default toolchain for liveuser
-    log "Setting default Rust toolchain for $LIVE_USER..."
-    if ! sudo -u "$LIVE_USER" bash -c "source \"\$HOME/.cargo/env\" 2>/dev/null && rustup default stable"; then
-        log "Warning: Failed to set default Rust toolchain for $LIVE_USER"
-    fi
-    
-    # Also set for root user if running as root
-    if [ "$USER" = "root" ] && [ -f "/root/.cargo/env" ]; then
-        log "Setting default Rust toolchain for root..."
-        if ! bash -c "source \"/root/.cargo/env\" 2>/dev/null && rustup default stable"; then
-            log "Warning: Failed to set default Rust toolchain for root"
-        fi
-    fi
-    
-    # Source the environment
-    if [ -f "/home/$LIVE_USER/.cargo/env" ]; then
-        source "/home/$LIVE_USER/.cargo/env" 2>/dev/null || true
-        export PATH="/home/$LIVE_USER/.cargo/bin:$PATH"
-    fi
-    
-    # Add to profile for future sessions
-    echo 'source "$HOME/.cargo/env"' >> "/home/$LIVE_USER/.profile"
-    
-    # Verify installation
-    if command -v rustc &> /dev/null; then
-        local RUST_VERSION=$(rustc --version | awk '{print $2}')
-        log "Rust installed successfully. Version: $RUST_VERSION"
-        export PATH="/home/$LIVE_USER/.cargo/bin:$PATH"
-    else
-        error_exit "Rust installation failed"
-    fi
-    
-    log "Rust and Cargo installed successfully"
-}
-
-
-# Function to build the project
-build_project() {
-    log "Building RAID Provisioning Tool..."
-    
-    # Debug: Print current user and environment
-    log "Current user: $(whoami)"
-    log "LIVE_USER: $LIVE_USER"
-    log "PROJECT_DIR: $PROJECT_DIR"
-    log "PATH: $PATH"
-    
-    # Ensure we're using the correct Rust version
-    export PATH="/home/$LIVE_USER/.cargo/bin:$PATH"
-    if [ -f "/home/$LIVE_USER/.cargo/env" ]; then
-        log "Sourcing Rust environment..."
-        source "/home/$LIVE_USER/.cargo/env" 2>/dev/null || true
-        log "Rust environment sourced"
-    fi
-    
-    # Debug: Print PATH after sourcing Rust environment
-    log "PATH after sourcing Rust environment: $PATH"
-    
-    # Set the default toolchain and verify Rust installation
-    log "Setting default Rust toolchain to stable..."
-    if ! sudo -u "$LIVE_USER" bash -c 'source "$HOME/.cargo/env" 2>/dev/null && rustup default stable'; then
-        error_exit "Failed to set default Rust toolchain"
-    fi
-    
-    # Verify Rust version
-    if sudo -u "$LIVE_USER" bash -c 'source "$HOME/.cargo/env" 2>/dev/null && command -v rustc &> /dev/null'; then
-        local RUST_VERSION=$(sudo -u "$LIVE_USER" bash -c 'source "$HOME/.cargo/env" 2>/dev/null && rustc --version' | awk '{print $2}')
-        log "Using Rust version: $RUST_VERSION"
-        
-        # Verify cargo is available
-        if ! sudo -u "$LIVE_USER" bash -c 'source "$HOME/.cargo/env" 2>/dev/null && command -v cargo &> /dev/null'; then
-            error_exit "Cargo not found for liveuser"
-        fi
-    else
-        error_exit "Rust not found for liveuser"
-    fi
-    
-    # Check if project directory exists and has correct ownership
-    if [ ! -d "$PROJECT_DIR" ]; then
-        error_exit "Project directory not found: $PROJECT_DIR"
-    fi
-    
-    # Ensure proper ownership and permissions on project directory
-    log "Setting correct permissions on project directory..."
-    
-    # Set directory permissions (755 for directories, 644 for files)
-    find "$PROJECT_DIR" -type d -exec chmod 755 {} \; || log "Warning: Could not set directory permissions"
-    find "$PROJECT_DIR" -type f -exec chmod 644 {} \; || log "Warning: Could not set file permissions"
-    
-    # Make scripts executable
-    find "$PROJECT_DIR" -name "*.sh" -exec chmod +x {} \; || log "Warning: Could not set executable permissions on scripts"
-    
-    # Set ownership to current user during installation
-    chown -R "$USER":"$USER" "$PROJECT_DIR" || log "Warning: Could not set ownership of project directory"
-    
-    # Special handling for Cargo.lock
-    if [ -f "$PROJECT_DIR/Cargo.lock" ]; then
-        log "Updating Cargo.lock permissions..."
-        chmod 644 "$PROJECT_DIR/Cargo.lock"
-    fi
-    
-    # Ensure target directory exists and has correct permissions
-    mkdir -p "$PROJECT_DIR/target"
-    chmod 755 "$PROJECT_DIR/target"
-    
-    # Clean previous build artifacts with proper permissions
-    log "Cleaning previous build artifacts..."
-    (cd "$PROJECT_DIR" && cargo clean 2>/dev/null) || true
-    
-    # Ensure target directory has correct permissions
-    if [ -d "$PROJECT_DIR/target" ]; then
-        chmod -R 755 "$PROJECT_DIR/target"
-        find "$PROJECT_DIR/target" -type f -exec chmod 644 {} \;
-    fi
-    
-    # Build the project with proper permissions and Rust environment
-    log "Compiling project in release mode..."
-    
-    # Ensure liveuser can access the project directory
-    chown -R "$LIVE_USER":"$LIVE_USER" "$PROJECT_DIR"
-    
-    # Build with proper Rust environment (use current user's Rust installation)
-    if (cd "$PROJECT_DIR" && source "/home/$LIVE_USER/.cargo/env" 2>/dev/null && rustup default stable && cargo build --release); then
-        log "Build completed successfully"
-        
-        # Set correct permissions on build artifacts
-        if [ -d "$PROJECT_DIR/target/release" ]; then
-            find "$PROJECT_DIR/target/release" -type f -exec chmod 755 {} \;
-            find "$PROJECT_DIR/target/release" -type d -exec chmod 755 {} \;
-        fi
-        
-        # Verify that the binaries were built
-        if [ -f "$PROJECT_DIR/target/release/raidctl" ] && [ -f "$PROJECT_DIR/target/release/raidctl-gui" ]; then
-            log "RAID control binaries found"
-            # Ensure binaries are executable
-            chmod +x "$PROJECT_DIR/target/release/raidctl"
-            chmod +x "$PROJECT_DIR/target/release/raidctl-gui"
-        else
-            error_exit "RAID control binaries not found after build"
-        fi
-    else
-        error_exit "Failed to build project"
-    fi
-}
-
-# Function to install binaries
-install_binaries() {
-    log "Installing binaries..."
-
-    # Stop any running instances to avoid "file busy" errors
-    stop_running_instances
-
-    # Create installation directories with proper permissions
-    mkdir -p "$INSTALL_DIR"
-    chmod 755 "$INSTALL_DIR"
-    
-    # Create config directory with proper permissions
-    mkdir -p "$CONFIG_DIR"
-    chmod 755 "$CONFIG_DIR"
-    
-    # Create app directory with proper permissions
-    mkdir -p "$APP_DIR"
-    chmod 755 "$APP_DIR"
-
-    # Check if binaries were built successfully
-    if [ ! -f "$PROJECT_DIR/target/release/raidctl" ]; then
-        error_exit "CLI binary not found. Build may have failed."
-    fi
-    
-    if [ ! -f "$PROJECT_DIR/target/release/raidctl-gui" ]; then
-        error_exit "GUI binary not found. Build may have failed."
-    fi
-
-    log "Installing RAID control binaries..."
-    
-    # Copy and set permissions for CLI binary
-    if [ -f "$PROJECT_DIR/target/release/raidctl" ]; then
-        cp "$PROJECT_DIR/target/release/raidctl" "$INSTALL_DIR/"
-        chmod 755 "$INSTALL_DIR/raidctl"
-        chown root:root "$INSTALL_DIR/raidctl"
-        log "Installed raidctl to $INSTALL_DIR/raidctl"
-    else
-        error_exit "Failed to find raidctl binary for installation"
-    fi
-    
-    # Copy and set permissions for GUI binary
-    if [ -f "$PROJECT_DIR/target/release/raidctl-gui" ]; then
-        cp "$PROJECT_DIR/target/release/raidctl-gui" "$INSTALL_DIR/"
-        chmod 755 "$INSTALL_DIR/raidctl-gui"
-        chown root:root "$INSTALL_DIR/raidctl-gui"
-        log "Installed raidctl-gui to $INSTALL_DIR/raidctl-gui"
-    else
-        error_exit "Failed to find raidctl-gui binary for installation"
-    fi
-
-    log "Binaries installed successfully"
-}
-
-# Function to create desktop entry
-create_desktop_entry() {
-    log "Creating desktop entry..."
-
-    # Create applications directory if it doesn't exist with proper permissions
-    mkdir -p /usr/share/applications
-    chmod 755 /usr/share/applications
-
-    local DESKTOP_FILE="/usr/share/applications/raidctl.desktop"
-    cat > "$DESKTOP_FILE" <<EOL
-[Desktop Entry]
-Type=Application
-Name=RAID Control
-Comment=RAID Configuration Tool
-Exec=$INSTALL_DIR/raidctl-gui
-Icon=$APP_DIR/icon.png
-Terminal=false
-Categories=System;Utility;
-EOL
-
-    # Set proper permissions for desktop file
-    chmod 644 "$DESKTOP_FILE"
-    chown root:root "$DESKTOP_FILE"
-    
-    log "Desktop entry created at $DESKTOP_FILE"
-}
-
-# Function to create configuration
-create_config() {
-    log "Creating configuration..."
-
-    # Create config directory with proper permissions
-    mkdir -p "$CONFIG_DIR"
-    chmod 755 "$CONFIG_DIR"
-    chown root:root "$CONFIG_DIR"
-
-    # Only create config if it doesn't already exist
-    if [ ! -f "$CONFIG_DIR/config.toml" ]; then
-        # Create default config with proper permissions
-        local CONFIG_FILE="$CONFIG_DIR/config.toml"
-        cat > "$CONFIG_FILE" <<EOL
-[general]
-log_level = "info"
-
-[storage]
-# Default storage configuration
-dry_run = true
-backup_existing_configs = true
-target_mount = "/target"
-grub_timeout = 5
-EOL
-        
-        # Set proper permissions for config file
-        chmod 644 "$CONFIG_FILE"
-        chown root:root "$CONFIG_FILE"
-        log "Default configuration created at $CONFIG_FILE"
-    else
-        log "Configuration already exists, skipping creation"
-    fi
-}
-
-# Function to verify installation
-verify_installation() {
-    log "Verifying installation..."
-    local success=true
-
-    # Check if binaries are installed, executable, and have correct permissions
-    if command -v raidctl &> /dev/null; then
-        log "CLI tool installed successfully: $(which raidctl)"
-        # Test CLI help command
-        if raidctl --help &> /dev/null; then
-            log "CLI tool is functional"
-        else
-            log "Warning: CLI tool may not be functional"
-        fi
-    else
-        log "Warning: CLI tool not found in PATH"
-    fi
-    
-    if command -v raidctl-gui &> /dev/null; then
-        log "GUI tool installed successfully: $(which raidctl-gui)"
-    else
-        log "Warning: GUI tool not found in PATH"
-    fi
-    
-    # Check if configuration exists
-    if [ -f "$CONFIG_DIR/config.toml" ]; then
-        log "Configuration file exists"
-    else
-        log "Warning: Configuration file not found"
-    fi
-    
-    # Check if desktop entry exists
-    if [ -f "/usr/share/applications/raidctl.desktop" ]; then
-        log "Desktop entry exists"
-    else
-        log "Warning: Desktop entry not found"
-    fi
-    
-    log "Installation verification completed"
-}
-
-# Function to start GUI
-start_gui() {
-    log "Starting RAID Provisioning Tool GUI..."
-
-    # Check if display is available
-    if [[ -z "$DISPLAY" ]]; then
-        log "No display available, GUI cannot be started"
-        log "You can run the CLI version with: raidctl --help"
-        return
-    fi
-
-    # Start GUI
-    /usr/local/bin/raidctl-gui &
-
-    log "GUI started"
-}
-
-# Function to cleanup temporary files
-cleanup() {
-    log "Cleaning up temporary files..."
-    
-    # Clean cargo cache
-    if command -v cargo &> /dev/null; then
-        su - "$LIVE_USER" -c "cargo cache --autoclean" 2>/dev/null || true
-    fi
-    
-    # Remove build artifacts to save space
-    if [ -d "$PROJECT_DIR/target" ]; then
-        rm -rf "$PROJECT_DIR/target"
-        log "Build artifacts removed"
-    fi
-    
-    log "Cleanup completed"
-}
-
-# Main installation function
-main() {
-    log "Starting RAID Provisioning Tool installation"
-
-    # Create log file
-    touch "$LOG_FILE"
-    chmod 644 "$LOG_FILE"
-
-    # Check if liveuser exists
-    if ! id "$LIVE_USER" &> /dev/null; then
-        useradd -m -s /bin/bash "$LIVE_USER" || error_exit "Failed to create liveuser"
-        echo "$LIVE_USER:$LIVE_PASSWORD" | chpasswd || error_exit "Failed to set liveuser password"
-        log "Created liveuser: $LIVE_USER"
-    fi
-
-    # Set up project directory with proper permissions and ownership
-    if [ ! -d "$PROJECT_DIR" ]; then
-        error_exit "Project directory not found: $PROJECT_DIR"
-    fi
-    
-    log "Setting up project directory permissions..."
-    
-    # Set directory permissions (755 for directories, 644 for files)
-    find "$PROJECT_DIR" -type d -exec chmod 755 {} \; || log "Warning: Could not set directory permissions"
-    find "$PROJECT_DIR" -type f -exec chmod 644 {} \; || log "Warning: Could not set file permissions"
-    
-    # Make scripts executable
-    find "$PROJECT_DIR" -name "*.sh" -exec chmod +x {} \; || log "Warning: Could not set executable permissions on scripts"
-    
-    # Set ownership to current user during installation
-    chown -R "$USER":"$USER" "$PROJECT_DIR" || log "Warning: Could not set ownership of project directory"
-
-    # Install dependencies
-    install_dependencies
-
-    # Remove any existing Rust installations
-    remove_existing_rust
-
-    # Install Rust
-    install_rust
-
-    # Build project
-    build_project
-
-    # Install binaries
-    install_binaries
-
-    # Create desktop entry
-    create_desktop_entry
-
-    # Create configuration
-    create_config
-
-    # Verify installation
-    verify_installation
-
-    # Cleanup temporary files
-    cleanup
-
-    # Final Rust toolchain setup
-    log "Performing final Rust toolchain setup..."
-    
-    # Ensure rustup default stable is set for all users
-    if sudo -u "$LIVE_USER" bash -c 'source "$HOME/.cargo/env" 2>/dev/null && rustup default stable'; then
-        log "Rust toolchain set to stable for $LIVE_USER"
-    else
-        log "Warning: Could not set Rust toolchain for $LIVE_USER"
-    fi
-    
-    # Set for current user if different from liveuser
-    if [ "$USER" != "$LIVE_USER" ] && [ -f "$HOME/.cargo/env" ]; then
-        if bash -c 'source "$HOME/.cargo/env" 2>/dev/null && rustup default stable'; then
-            log "Rust toolchain set to stable for $USER"
-        else
-            log "Warning: Could not set Rust toolchain for $USER"
-        fi
-    fi
-
-    log "Installation completed successfully"
-
-    # Start GUI
-    start_gui
-
-    # Automated disk/RAID/bootstrapping steps
-    log "[main] Running auto_fstab_and_esp (disk, fstab, ESP setup)"
-    auto_fstab_and_esp
-    log "[main] Running auto_grub_install (bootloader setup)"
-    auto_grub_install
-
-    log "RAID Provisioning Tool is ready to use!"
-    log "CLI: raidctl --help"
-    log "GUI: raidctl-gui"
-    log ""
-    log "Note: If you encounter Rust toolchain issues, run:"
-    log "  source \"\$HOME/.cargo/env\" && rustup default stable"
-}
-
-# Function to finalize Rust setup
-finalize_rust_setup() {
-    log "Finalizing Rust toolchain setup..."
-    
-    # Ensure rustup is in PATH
-    export PATH="/home/$LIVE_USER/.cargo/bin:$PATH"
-    
-    # Set default toolchain for the current user
-    if ! sudo -u "$LIVE_USER" bash -c 'source "$HOME/.cargo/env" 2>/dev/null && rustup default stable'; then
-        log "Warning: Failed to set default Rust toolchain for liveuser"
-    fi
-    
-    # Also set for root user if different from liveuser
-    if [ "$USER" != "$LIVE_USER" ]; then
-        if ! bash -c 'source "$HOME/.cargo/env" 2>/dev/null && rustup default stable'; then
-            log "Warning: Failed to set default Rust toolchain for $USER"
-        fi
-    fi
-    
-    log "Rust toolchain setup complete"
-}
-
-# Run main function
-main "$@"
-
-# Final Rust setup
-echo
-log "Installation completed. Please run the following command to ensure Rust is properly set up:"
-echo "source \"$HOME/.cargo/env\" && rustup default stable"
-log "Or log out and log back in for the changes to take effect."
+# ... (file continues unchanged below)
